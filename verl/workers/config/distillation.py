@@ -33,7 +33,14 @@ class DistillationLossConfig(BaseConfig):
     """Configuration for distillation loss settings.
 
     loss_mode (str):
-        Distillation loss function to use.
+        Distillation loss function to use. Top-k variants for FSDP backend:
+        - "forward_kl_topk":        KL(P_full || Q_full) on teacher's top-k indices,
+                                    both distributions full-vocab normalized
+                                    (verl native; default for verl users).
+        - "forward_kl_topk_renorm": KL(P_tilde || Q_tilde) where both distributions
+                                    are renormalized to sum to 1 over the top-k
+                                    subset before KL (matches GKD paper Eq. 8 and
+                                    ms-swift's beta=0 implementation).
     topk (int, optional):
         Number of top tokens to consider for top-k distillation losses.
     use_task_rewards (bool):
@@ -97,9 +104,9 @@ class DistillationLossConfig(BaseConfig):
                 f"but got {self.policy_loss_mode}."
             )
 
-        if self.use_policy_gradient and self.loss_mode == "forward_kl_topk":
+        if self.use_policy_gradient and self.loss_mode in ("forward_kl_topk", "forward_kl_topk_renorm"):
             print(
-                "WARNING: forward_kl_topk is most effective as a supervised distillation loss "
+                f"WARNING: {self.loss_mode} is most effective as a supervised distillation loss "
                 "(use_policy_gradient=False). With policy gradient, the update uses only the sampled"
                 " token's logprob ∇logπ(a), so the top-k distributional signal (how non-sampled logits "
                 "should move) is largely unused."

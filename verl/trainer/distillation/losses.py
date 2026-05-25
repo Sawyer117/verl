@@ -134,15 +134,30 @@ def compute_topk_loss(
     - student_mass: (bsz, seqlen/cp_size)
     - teacher_mass: (bsz, seqlen/cp_size)
     """
+    loss_mode = distillation_config.distillation_loss.loss_mode
     match config.strategy:
         # VeOmni uses FSDP2 internally, so its loss computation is identical to FSDP.
         case "fsdp" | "veomni":
             import verl.trainer.distillation.fsdp.losses as fsdp_losses
 
-            distillation_loss_fn = fsdp_losses.compute_forward_kl_topk
+            fsdp_topk_fn_map = {
+                "forward_kl_topk": fsdp_losses.compute_forward_kl_topk,
+                "forward_kl_topk_renorm": fsdp_losses.compute_forward_kl_topk_renorm,
+            }
+            if loss_mode not in fsdp_topk_fn_map:
+                raise NotImplementedError(
+                    f"loss_mode={loss_mode!r} is not a registered top-k loss for FSDP backend. "
+                    f"Supported: {list(fsdp_topk_fn_map.keys())}"
+                )
+            distillation_loss_fn = fsdp_topk_fn_map[loss_mode]
         case "megatron":
             import verl.trainer.distillation.megatron.losses as megatron_losses
 
+            if loss_mode != "forward_kl_topk":
+                raise NotImplementedError(
+                    f"Megatron backend only supports loss_mode='forward_kl_topk' for top-k losses; "
+                    f"got {loss_mode!r}."
+                )
             distillation_loss_fn = megatron_losses.compute_forward_kl_topk
         case _:
             raise NotImplementedError(f"Unsupported strategy: {config.strategy=}")
@@ -291,7 +306,9 @@ def distillation_loss(
     return distillation_loss, distillation_metrics
 
 
-@register_distillation_loss(DistillationLossSettings(names=["forward_kl_topk"], use_topk=True))  # type: ignore[arg-type]
+@register_distillation_loss(
+    DistillationLossSettings(names=["forward_kl_topk", "forward_kl_topk_renorm"], use_topk=True)
+)  # type: ignore[arg-type]
 def compute_forward_kl_topk(
     config: ActorConfig,
     distillation_config: DistillationConfig,
@@ -299,6 +316,12 @@ def compute_forward_kl_topk(
     data: TensorDict,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """Compute forward KL distillation loss and related metrics using top-k log probabilities.
+
+    Used as the post-processing wrapper for both ``forward_kl_topk`` (full-vocab
+    normalized, verl-native) and ``forward_kl_topk_renorm`` (renormalized over
+    top-k, GKD paper Eq. 8 / ms-swift convention). The actual KL computation
+    happens inside the logits processor; this wrapper only does metric
+    aggregation and a defensive clamp_min(0).
 
     Returns:
     - distillation_losses: (bsz, resp_len)
