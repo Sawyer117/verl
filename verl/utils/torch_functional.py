@@ -16,6 +16,7 @@ Contain small torch utilities
 """
 
 import math
+import os
 from contextlib import contextmanager
 from typing import Optional
 
@@ -141,6 +142,17 @@ def logprobs_from_logits_torch_npu(logits: torch.Tensor, labels: torch.Tensor) -
     """
     batch_dim = logits.shape[:-1]
     logits = logits.reshape(-1, logits.shape[-1])
+    # DRKERNEL fix: vLLM computes rollout logprobs with a float32 log_softmax
+    # (vllm v1 sample/sampler.py: compute_logprobs -> log_softmax(dtype=torch.float32)),
+    # but torch_npu.npu_cross_entropy_loss computes its logsumexp in the INPUT dtype.
+    # A bf16 logsumexp over a large vocab is systematically biased high (cf. the
+    # logprobs_from_logits_v2 note "logsumexp approach is unstable with bfloat16"),
+    # which biases this recomputed logprob low -> a ~0.06 nat one-sided gap vs the fp32
+    # rollout logprob, large enough that the MRS rollout_rs mask rejects ~all tokens.
+    # Upcast to fp32 to match the rollout path. Default on; set DKV_FP32_LOGPROB=0 to A/B.
+    # (Peak mem is bounded by the per-microbatch logits, not the full batch.)
+    if os.environ.get("DKV_FP32_LOGPROB", "1") != "0":
+        logits = logits.float()
     loss, _, _, _ = torch_npu.npu_cross_entropy_loss(logits, labels.reshape(-1), reduction="none")
     return -loss.view(*batch_dim)
 
