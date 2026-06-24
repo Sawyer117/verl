@@ -11,13 +11,37 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import logging
+import os
 
 import torch
 
 from verl.protocol import DataProto
 
 logger = logging.getLogger(__file__)
+
+
+def _dump_logprob_diag(path, data, rollout_lp, actor_lp, mask_bool, max_seqs=8):
+    """DRKERNEL DIAG (env-gated, no training-behavior change).
+
+    Append per-token (token_id, rollout_logprob, actor_logprob) for the first
+    few valid sequences so we can localize the vLLM-ascend forward vs FSDP/HF
+    forward divergence: a uniform gap => precision/scale; a spiky gap at certain
+    tokens => a kernel/attention/specific-token issue. rollout_lp/actor_lp and
+    mask_bool are already response-length aligned (same as response_mask_bool).
+    """
+    responses = data.batch["responses"]
+    n = min(max_seqs, responses.size(0))
+    with open(path, "a") as f:
+        for i in range(n):
+            idx = mask_bool[i].nonzero(as_tuple=True)[0]
+            if idx.numel() == 0:
+                continue
+            tok = responses[i][idx].tolist()
+            r = rollout_lp[i][idx].float().tolist()
+            a = actor_lp[i][idx].float().tolist()
+            f.write(json.dumps({"n_tok": len(tok), "token_id": tok, "rollout_lp": r, "actor_lp": a}) + "\n")
 
 
 def calculate_token_list_diff(tensor1: torch.Tensor, tensor2: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -112,6 +136,16 @@ def calculate_debug_metrics(data: DataProto) -> dict:
 
     pearson_corrcoef = pearson_correlation_coefficient(actor_probs, rollout_probs, response_mask_bool)
     rollout_probs_diff = calculate_log_prob_diff(actor_probs, rollout_probs, response_mask_bool)
+
+    # DRKERNEL DIAG: dump per-token rollout-vs-actor logprob to localize the
+    # vLLM-ascend forward vs FSDP forward gap. Gated by DKV_LOGPROB_DIAG; no-op otherwise.
+    _diag_path = os.environ.get("DKV_LOGPROB_DIAG")
+    if _diag_path:
+        try:
+            _dump_logprob_diag(_diag_path, data, rollout_old_log_probs, actor_old_log_probs, response_mask_bool)
+        except Exception as _e:  # never break training on a diag failure
+            logger.warning(f"[DKV diag] dump failed: {_e}")
+
     return {
         "training/rollout_probs_diff_valid": 1,
         "training/rollout_probs_diff_max": torch.max(rollout_probs_diff).detach().item(),
