@@ -123,12 +123,37 @@ def get_vllm_max_lora_rank(lora_rank: int):
 def monkey_patch_compute_logits(model, vocab_size: int):
     original_compute_logits = model.compute_logits
 
+    # DKV OOV probe: this masks out-of-vocab logits (>=vocab_size) so the model can't
+    # sample OOV tokens (vLLM #13175 workaround). It's INEFFECTIVE on vllm-ascend 0.20
+    # (model still samples id>=vocab_size -> -inf rollout logprobs). Print twice/worker
+    # (no flooding) to find out why: (a) is the patch applied here, (b) is THIS wrapped
+    # compute_logits actually called at inference (else it's bypassed by an ACL graph),
+    # (c) the logits last dim -- full vocab (mask works) vs a TP-local shard (then
+    # `logits[..., vocab_size:]` is an empty slice and masks nothing). DKV_OOV_PROBE=0 silences.
+    _probe = os.environ.get("DKV_OOV_PROBE", "1") != "0"
+    if _probe:
+        print(f"[DKV OOV patch] APPLIED on {type(model).__name__}; vocab_size={vocab_size}", flush=True)
+    _seen = []
+
     def compute_logits(
         self,
         *args,
         **kwargs,
     ) -> torch.Tensor:
         logits = original_compute_logits(*args, **kwargs)
+        if _probe and not _seen:
+            _seen.append(1)
+            try:
+                _w = logits.shape[-1]
+                _oov = int((logits[..., vocab_size:] != float("-inf")).sum().item()) if _w > vocab_size else -1
+                print(
+                    f"[DKV OOV patch] compute_logits CALLED @inference: logits.shape={tuple(logits.shape)}; "
+                    f"last_dim={_w} vs vocab_size={vocab_size}; oov_cols={_w - vocab_size}; "
+                    f"finite_oov_before_mask={_oov}",
+                    flush=True,
+                )
+            except Exception as _e:  # never break generation on a probe
+                print(f"[DKV OOV patch] probe failed: {_e}", flush=True)
         logits[..., vocab_size:] = float("-inf")
         return logits
 
