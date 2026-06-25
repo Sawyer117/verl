@@ -19,6 +19,7 @@ PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface
 """
 
+import os
 import uuid
 from pprint import pprint
 from typing import Any, Optional
@@ -592,6 +593,24 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
                 and not bypass_recomputing_logprobs  # Only in decoupled mode
             ):
                 from verl.trainer.ppo.rollout_corr_helper import compute_rollout_correction_and_add_to_batch
+
+                # DRKERNEL: vllm-ascend can return -inf logprobs for some sampled tokens even
+                # in raw_logprobs mode (surfaces at long context / multi-turn, not at short
+                # SMOKE lengths). A single -inf token has its log_ratio clamped to SAFETY_BOUND
+                # (=20), which inflates that sequence's seq_mean_k1 far past the rs threshold so
+                # the WHOLE sequence is rejected (and makes rollout_corr kl/ppl/chi2 non-finite).
+                # Neutralize those tokens by falling back to the trainer's recomputed old_log_prob
+                # (log_ratio -> 0, IS -> 1 = treat as on-policy): a bogus vLLM value can no longer
+                # reject a real sample, yet the token still contributes to the gradient. The fp32
+                # logprob fix already drove the systematic gap to ~0, so this should take masking
+                # from ~77% back down to ~0%. Set DKV_SANITIZE_ROLLOUT_INF=0 to A/B.
+                if os.environ.get("DKV_SANITIZE_ROLLOUT_INF", "1") != "0" and "old_log_probs" in batch.batch:
+                    _rlp = batch.batch["rollout_log_probs"]
+                    _bad = ~torch.isfinite(_rlp)
+                    if _bad.any():
+                        batch.batch["rollout_log_probs"] = torch.where(
+                            _bad, batch.batch["old_log_probs"].to(_rlp.dtype), _rlp
+                        )
 
                 # Compute IS weights, apply rejection sampling, compute metrics
                 batch, is_metrics = compute_rollout_correction_and_add_to_batch(batch, rollout_corr_config)
