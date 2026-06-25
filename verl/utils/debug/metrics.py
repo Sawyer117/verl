@@ -31,6 +31,9 @@ def _dump_logprob_diag(path, data, rollout_lp, actor_lp, mask_bool, max_seqs=8):
     tokens => a kernel/attention/specific-token issue. rollout_lp/actor_lp and
     mask_bool are already response-length aligned (same as response_mask_bool).
     """
+    # Cap total size so a long run doesn't accumulate GBs (we only need the first ~2 steps).
+    if os.path.exists(path) and os.path.getsize(path) > 60_000_000:  # ~60MB ~= 10+ steps
+        return
     responses = data.batch["responses"]
     n = min(max_seqs, responses.size(0))
     with open(path, "a") as f:
