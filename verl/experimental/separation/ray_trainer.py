@@ -19,7 +19,6 @@ PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface
 """
 
-import os
 import uuid
 from pprint import pprint
 from typing import Any, Optional
@@ -593,50 +592,6 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
                 and not bypass_recomputing_logprobs  # Only in decoupled mode
             ):
                 from verl.trainer.ppo.rollout_corr_helper import compute_rollout_correction_and_add_to_batch
-
-                # DRKERNEL: vllm-ascend can return -inf logprobs for some sampled tokens even
-                # in raw_logprobs mode (surfaces at long context / multi-turn, not at short
-                # SMOKE lengths). A single -inf token has its log_ratio clamped to SAFETY_BOUND
-                # (=20), which inflates that sequence's seq_mean_k1 far past the rs threshold so
-                # the WHOLE sequence is rejected (and makes rollout_corr kl/ppl/chi2 non-finite).
-                # Neutralize those tokens by falling back to the trainer's recomputed old_log_prob
-                # (log_ratio -> 0, IS -> 1 = treat as on-policy): a bogus vLLM value can no longer
-                # reject a real sample, yet the token still contributes to the gradient. The fp32
-                # logprob fix already drove the systematic gap to ~0, so this should take masking
-                # from ~77% back down to ~0%. Set DKV_SANITIZE_ROLLOUT_INF=0 to A/B.
-                if os.environ.get("DKV_SANITIZE_ROLLOUT_INF", "1") != "0" and "old_log_probs" in batch.batch:
-                    _rlp = batch.batch["rollout_log_probs"]
-                    _bad = ~torch.isfinite(_rlp)
-                    if _bad.any():
-                        # Root-cause diag (one compact line per step, only when -inf exist;
-                        # NOT per-token, so it does not flood the log). Grep "DKV -inf".
-                        # Reports which token_ids go -inf (Qwen3: 151645=<|im_end|>,
-                        # 151643=<|endoftext|>, 151644=<|im_start|>) and how many sit at a
-                        # turn boundary (last response_mask=1 before a 0 / sequence end).
-                        # DKV_INF_DIAG=0 to silence once the source is understood.
-                        if os.environ.get("DKV_INF_DIAG", "1") != "0":
-                            try:
-                                _nb = int(_bad.sum().item())
-                                _ns = int(_bad.any(dim=1).sum().item())
-                                _msg = f"[DKV -inf diag] {_nb} -inf rollout-logprobs in {_ns}/{_bad.shape[0]} seqs"
-                                _resp = batch.batch.get("responses")
-                                if _resp is not None and tuple(_resp.shape) == tuple(_rlp.shape):
-                                    _ids, _cnts = torch.unique(_resp[_bad], return_counts=True)
-                                    _o = torch.argsort(_cnts, descending=True)[:5]
-                                    _msg += "; top token_ids=[" + ", ".join(
-                                        f"{int(_ids[k])}:{int(_cnts[k])}" for k in _o) + "]"
-                                _rm = batch.batch.get("response_mask")
-                                if _rm is not None and tuple(_rm.shape) == tuple(_rlp.shape):
-                                    _m = _rm.bool()
-                                    _end = _m.clone()
-                                    _end[:, :-1] &= ~_m[:, 1:]  # mask=1 and next is 0 => run end
-                                    _msg += f"; {int((_bad & _end).sum().item())}/{_nb} at turn-end"
-                                print(_msg, flush=True)
-                            except Exception as _e:
-                                print(f"[DKV -inf diag] failed: {_e}", flush=True)
-                        batch.batch["rollout_log_probs"] = torch.where(
-                            _bad, batch.batch["old_log_probs"].to(_rlp.dtype), _rlp
-                        )
 
                 # Compute IS weights, apply rejection sampling, compute metrics
                 batch, is_metrics = compute_rollout_correction_and_add_to_batch(batch, rollout_corr_config)
