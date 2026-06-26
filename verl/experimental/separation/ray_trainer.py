@@ -23,6 +23,8 @@ import uuid
 from pprint import pprint
 from typing import Any, Optional
 
+import os
+
 import numpy as np
 import torch
 from omegaconf import OmegaConf
@@ -591,6 +593,37 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
                 and "rollout_log_probs" in batch.batch
                 and not bypass_recomputing_logprobs  # Only in decoupled mode
             ):
+                # --- DKV targeted rollout-logprob sanitize (env DKV_SANITIZE_ROLLOUT, default OFF) ---
+                # vllm-ascend 0.20.2rc1's rollout forward occasionally records a spuriously
+                # HIGH logprob for a token (e.g. '\n\n'/271) that the trainer recompute says is
+                # near-impossible (|old_lp - rollout_lp| ~25 nats). IS already zeroes those
+                # tokens' gradient (exp(-25)~0), but the per-token log-ratio (clamped to
+                # SAFETY_BOUND) still drags the sequence's seq_mean_k1 out of the RS band -> the
+                # whole (often multi-turn) sequence is rejected -> selection bias toward short/
+                # single-turn. Where rollout & trainer disagree by > DKV_SANITIZE_THRESHOLD nats
+                # on a RESPONSE token, fall back to the trainer's logprob (== what the uncorrupted
+                # old stack would have recorded) -> log_ratio 0, IS 1, the sequence survives.
+                # Runs BEFORE compute_rollout_correction (reads rollout_log_probs) but AFTER the
+                # DKV_LOGPROB_DIAG dump in _fit_compute_log_prob, so the diag still shows the RAW
+                # corruption (TP/eager fix is still observable). No-op when unset; never raises.
+                if os.environ.get("DKV_SANITIZE_ROLLOUT", "0") != "0":
+                    try:
+                        _rlp = batch.batch["rollout_log_probs"]
+                        _olp = batch.batch["old_log_probs"]
+                        _rm = batch.batch["response_mask"]
+                        if _rm.shape[-1] != _rlp.shape[-1]:
+                            _rm = _rm[:, -_rlp.shape[-1]:]
+                        _rm = _rm.bool()
+                        _thr = float(os.environ.get("DKV_SANITIZE_THRESHOLD", "5.0"))
+                        _bad = ((_olp - _rlp).abs() > _thr) & _rm
+                        _n_bad = int(_bad.sum().item())
+                        if _n_bad > 0:
+                            batch.batch["rollout_log_probs"] = torch.where(_bad, _olp.to(_rlp.dtype), _rlp)
+                        metrics["rollout_corr/dkv_sanitized_tokens"] = _n_bad
+                        metrics["rollout_corr/dkv_sanitized_frac"] = _n_bad / max(1, int(_rm.sum().item()))
+                    except Exception as _e:  # never break training over a diagnostic sanitize
+                        print(f"[DKV sanitize] skipped: {_e}")
+
                 from verl.trainer.ppo.rollout_corr_helper import compute_rollout_correction_and_add_to_batch
 
                 # Compute IS weights, apply rejection sampling, compute metrics
