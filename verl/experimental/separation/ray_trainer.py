@@ -19,11 +19,10 @@ PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface
 """
 
+import os
 import uuid
 from pprint import pprint
 from typing import Any, Optional
-
-import os
 
 import numpy as np
 import torch
