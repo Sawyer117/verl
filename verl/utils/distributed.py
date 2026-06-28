@@ -109,7 +109,8 @@ def stateless_init_process_group(master_address, master_port, rank, world_size, 
     # from sglang.srt.distributed.device_communicators.pynccl import PyNcclCommunicator
     # from sglang.srt.distributed.utils import statelessprocessgroup
 
-    from vllm.distributed.utils import StatelessProcessGroup, create_tcp_store
+    from torch.distributed import TCPStore
+    from vllm.distributed.utils import StatelessProcessGroup
 
     from verl.utils.device import is_npu_available
 
@@ -130,10 +131,10 @@ def stateless_init_process_group(master_address, master_port, rank, world_size, 
         This is copied from vllm/distributed/utils.py:StatelessProcessGroup.create
         Modified to support ipv6 stateless communication groups.
 
-        Re-synced to vLLM >=0.20: StatelessProcessGroup no longer holds the listen
-        socket (the `socket=` field was removed). The listen socket's fd is now handed
-        to the TCPStore via create_tcp_store(), which detaches it (TCPStore takes
-        ownership), so we no longer pass `socket=` to the dataclass."""
+        DKV(vllm018): vLLM 0.18 keeps the OLD StatelessProcessGroup API - it still
+        holds the listen socket (the `socket=` field) and the raw TCPStore takes the
+        listen fd via master_listen_fd. (The 0.20 create_tcp_store path lives on the
+        drkernel-port branch; do NOT use it here - vLLM 0.18 has no create_tcp_store.)"""
         launch_server = rank == 0
         if launch_server:
             # listen on the specified interface (instead of 0.0.0.0)
@@ -144,23 +145,26 @@ def stateless_init_process_group(master_address, master_port, rank, world_size, 
             listen_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             listen_socket.bind((host, port))
             listen_socket.listen()
+            listen_fd = listen_socket.fileno()
         else:
             listen_socket = None
+            listen_fd = None
 
-        store = create_tcp_store(
-            host,
-            port,
-            listen_socket=listen_socket,
+        store = TCPStore(
+            host_name=host,
+            port=port,
             world_size=world_size,
             is_master=launch_server,
             timeout=timedelta(seconds=store_timeout),
             use_libuv=False,  # for now: github.com/pytorch/pytorch/pull/150215
+            master_listen_fd=listen_fd,
         )
 
         return StatelessProcessGroup(
             rank=rank,
             world_size=world_size,
             store=store,
+            socket=listen_socket,
             data_expiration_seconds=data_expiration_seconds,
         )
 
